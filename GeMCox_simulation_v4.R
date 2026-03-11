@@ -1,276 +1,261 @@
 ###############################################################
-## GeM-Cox Simulation v4
+## GeM-Cox Simulation v4 — Production Run
 ##
-## KEY FIX: normalize_gmm_by_dim = FALSE
-##   The 1/q normalization with q=10 flattens GMM posteriors
-##   to near-uniform, preventing cluster recovery even on clean
-##   well-separated data. Turning it off restores full GMM
-##   discriminative power. Gamma still balances GMM vs survival.
+## ROOT CAUSE FIX: normalize_gmm_by_dim = FALSE
+## Target: < 10 min on 24-core Windows PC
 ##
-## Uses GeMCox_improved_v4.R (shared-baseline EM, fold-safe
-## preprocessing, correct 1-SE rule)
-##
-## DGP: signal on OBSERVABLE features, Gaussian
+## Timing budget (24 cores, PSOCK):
+##   18 scenarios → 1 batch of 18 workers (fits in 24 cores)
+##   20 reps/scenario, each ~15s → 20*15/1 = 300s = 5 min
+##   Overhead (cluster setup, summary) ~1 min
+##   Total: ~6 min
 ###############################################################
 
-required_pkgs <- c("survival","glmnet","mclust","dplyr","tidyr",
-                   "ggplot2","patchwork","tibble","MASS","parallel")
+required_pkgs <- c("survival","glmnet","mclust","dplyr",
+                   "tidyr","tibble","MASS","parallel")
 for (pkg in required_pkgs)
   if (!requireNamespace(pkg, quietly=TRUE))
     install.packages(pkg, repos="https://cloud.r-project.org")
 
 library(survival); library(glmnet); library(mclust)
-library(dplyr); library(tidyr); library(ggplot2)
-library(patchwork); library(tibble); library(MASS); library(parallel)
+library(dplyr); library(tidyr); library(tibble)
+library(MASS); library(parallel)
 select <- dplyr::select; filter <- dplyr::filter
 mutate <- dplyr::mutate; arrange <- dplyr::arrange
 
 source("GeMCox_improved_v4.R")
 set.seed(2025)
 
-## ---- DGP: Gaussian features, signal on observable space ----
-simulate_gemcox_v4 <- function(
-    n=117, K=2, p_gmm=10, p_cox=10,
-    p_gmm_signal=5, p_beta_signal=4,
-    pi_c=NULL, separation=c("med","low","high"),
-    feat_corr=0.2, event_rate=0.44,
-    t_max=253, weibull_shape=1.5,
-    baseline_var=0.2, seed=1) {
-
+###############################################################
+## DGP: Gaussian, signal on observable space
+###############################################################
+simulate_v4 <- function(n=117, K=2, p=10, p_sig=5, p_beta=4,
+                         separation=c("med","low","high"),
+                         rho=0.2, event_rate=0.44, seed=1) {
   separation <- match.arg(separation)
   set.seed(seed)
-  delta_mu <- switch(separation, low=0.6, med=1.2, high=2.0)
-  delta_beta <- switch(separation, low=0.3, med=0.6, high=1.0)
-  if (is.null(pi_c)) pi_c <- rep(1/K, K)
-  p_gmm_signal <- min(p_gmm_signal, p_gmm)
-  p_beta_signal <- min(p_beta_signal, p_cox)
+  dmu  <- switch(separation, low=0.6, med=1.2, high=2.0)
+  dbeta <- switch(separation, low=0.3, med=0.6, high=1.0)
+  pi_c <- rep(1/K, K)
+  pos <- seq(-(K-1)/2,(K-1)/2,length.out=K)
 
-  positions <- seq(-(K-1)/2, (K-1)/2, length.out=K) * delta_mu
-  mu_list <- lapply(1:K, function(k) {
-    m <- rep(0, p_gmm)
-    for (j in seq_len(p_gmm_signal)) m[j] <- positions[k]/sqrt(j)
-    m
-  })
-  Sigma <- outer(1:p_gmm, 1:p_gmm, function(i,j) feat_corr^abs(i-j))
+  mu_list <- lapply(1:K, function(k){m<-rep(0,p)
+    for(j in 1:min(p_sig,p)) m[j]<-pos[k]*dmu/sqrt(j); m})
+  Sigma <- outer(1:p,1:p,function(i,j) rho^abs(i-j))
 
-  beta_base <- rep(0, p_cox)
-  beta_base[1:p_beta_signal] <- c(0.8,-0.5,0.4,-0.3)[1:p_beta_signal]
-  beta_list <- lapply(1:K, function(k) {
-    pos <- (k-(K+1)/2); b <- beta_base
-    for (j in seq_len(min(3,p_beta_signal)))
-      b[j] <- b[j] + delta_beta*pos/sqrt(j)
-    b
-  })
+  bb <- rep(0,p); bb[1:min(p_beta,p)] <- c(0.8,-0.5,0.4,-0.3)[1:min(p_beta,p)]
+  beta_list <- lapply(1:K, function(k){b<-bb
+    for(j in 1:min(3,p_beta)) b[j]<-b[j]+dbeta*pos[k]/sqrt(j); b})
 
-  scale_pos <- seq(-(K-1)/2,(K-1)/2,length.out=K)
-  weibull_scales <- 200*exp(baseline_var*scale_pos)
+  wscales <- 200*exp(0.2*pos)
+  Z <- sample(1:K,n,replace=TRUE,prob=pi_c)
+  X <- matrix(0,n,p)
+  for(k in 1:K){i<-which(Z==k);if(!length(i))next
+    X[i,]<-mvrnorm(length(i),mu_list[[k]],Sigma)}
+  colnames(X)<-paste0("f",1:p)
 
-  Z <- sample(1:K, n, replace=TRUE, prob=pi_c)
-  X <- matrix(0, n, p_gmm)
-  for (k in 1:K) {
-    idx <- which(Z==k); if(!length(idx)) next
-    X[idx,] <- mvrnorm(length(idx), mu_list[[k]], Sigma)
-  }
-  colnames(X) <- paste0("feat_",1:p_gmm)
-  X_cox <- X[,1:p_cox,drop=FALSE]
+  Tt<-numeric(n)
+  for(k in 1:K){i<-which(Z==k);if(!length(i))next
+    eta<-pmin(pmax(as.numeric(X[i,,drop=F]%*%beta_list[[k]]),-5),5)
+    Tt[i]<-wscales[k]*(-log(runif(length(i))))^(1/1.5)*exp(-eta/1.5)}
 
-  T_true <- numeric(n)
-  for (k in 1:K) {
-    idx <- which(Z==k); if(!length(idx)) next
-    eta <- pmin(pmax(as.numeric(X_cox[idx,,drop=FALSE] %*% beta_list[[k]]),-5),5)
-    T_true[idx] <- weibull_scales[k]*(-log(runif(length(idx))))^(1/weibull_shape)*exp(-eta/weibull_shape)
-  }
+  # Calibrate censoring
+  lo<-1e-6;hi<-10
+  for(it in 1:50){mid<-(lo+hi)/2
+    er<-mean(Tt<=pmin(rexp(n,mid),253))
+    if(abs(er-event_rate)<0.005)break
+    if(er<event_rate)hi<-mid else lo<-mid}
+  C<-pmin(rexp(n,mid),253)
+  time<-pmax(pmin(Tt,C)+runif(n,0,0.01),0.1)
+  status<-as.integer(Tt<=C)
 
-  cal <- function(tgt,Tl,tm){lo<-1e-6;hi<-10
-    for(it in 1:60){mid<-(lo+hi)/2;er<-mean(Tl<=pmin(rexp(length(Tl),mid),tm))
-      if(abs(er-tgt)<0.005)break;if(er<tgt)hi<-mid else lo<-mid};mid}
-  cr <- cal(event_rate,T_true,t_max)
-  C <- pmin(rexp(n,cr),t_max)
-  time <- pmax(pmin(T_true,C)+runif(n,0,0.01),0.1)
-  status <- as.integer(T_true<=C)
-
-  list(X_gmm=X, X_cox=X_cox, time=time, status=status, Z_true=Z,
-       params=list(K=K,pi_c=pi_c,mu_list=mu_list,beta_list=beta_list,
-                   Sigma=Sigma,separation=separation,
-                   delta_mu=delta_mu,delta_beta=delta_beta,
-                   weibull_scales=weibull_scales,
-                   actual_event_rate=mean(status)))
+  list(X_gmm=X,X_cox=X,time=time,status=status,Z_true=Z,
+       params=list(K=K,beta_list=beta_list,separation=separation,
+                   dmu=dmu,dbeta=dbeta,er_actual=mean(status)))
 }
 
-## ---- Single replicate using v4 shared-baseline EM ----
-## KEY: normalize_gmm_by_dim = FALSE everywhere
-run_replicate_v4 <- function(sim_data, K_grid=1:3,
-    gamma_grid=c(0, 0.5, 1.0, 2.0),
-    nfolds=3, max_iter=50,
-    n_starts=5, n_starts_final=10,
-    alpha=0.5, baseline_mode="shared",
-    verbose=FALSE) {
-
-  X_gmm<-sim_data$X_gmm; X_cox<-sim_data$X_cox
-  time<-sim_data$time; status<-sim_data$status
-  Z_true<-sim_data$Z_true; K_true<-sim_data$params$K
-
-  result <- list(K_true=K_true, K_selected=NA_integer_,
+###############################################################
+## Single replicate — KEY: normalize_gmm_by_dim=FALSE
+###############################################################
+run_rep <- function(sd, K_grid=1:3, gamma_grid=c(0,1.0,2.0),
+                    nfolds=3, max_iter=30, n_starts=3,
+                    n_starts_final=5, alpha=0.5) {
+  r <- list(K_true=sd$params$K, K_selected=NA_integer_,
     K_correct=NA_integer_, gamma_selected=NA_real_,
     ARI=NA_real_, cindex_full=NA_real_, cindex_cv=NA_real_,
     cindex_cox1=NA_real_, beta_rmse=NA_real_,
-    n_events=sum(status), event_rate_actual=mean(status),
+    event_rate_actual=mean(sd$status),
     converged=NA_integer_, error_msg=NA_character_)
 
-  ## Single Cox baseline
-  result$cindex_cox1 <- tryCatch({
-    sc <- make_x_scaler(X_cox); Xs <- apply_x_scaler(X_cox,sc)
-    lam <- tryCatch(cv.glmnet(Xs,Surv(time,status),family="cox",
+  # Single Cox baseline
+  r$cindex_cox1 <- tryCatch({
+    sc<-make_x_scaler(sd$X_cox); Xs<-apply_x_scaler(sd$X_cox,sc)
+    lam<-tryCatch(cv.glmnet(Xs,Surv(sd$time,sd$status),family="cox",
       alpha=alpha,standardize=FALSE,nfolds=3)$lambda.1se,error=function(e)0.05)
-    gfit <- glmnet(Xs,Surv(time,status),family="cox",
+    gf<-glmnet(Xs,Surv(sd$time,sd$status),family="cox",
       alpha=alpha,lambda=lam,standardize=FALSE)
-    c_index(time,status,as.numeric(Xs%*%coef(gfit,s=lam)))
-  }, error=function(e) NA_real_)
+    c_index(sd$time,sd$status,as.numeric(Xs%*%coef(gf,s=lam)))
+  },error=function(e)NA_real_)
 
-  ## CV — KEY FIX: normalize_gmm_by_dim=FALSE passed through
-  cv_res <- tryCatch(cv_select_K_gamma_v4(
-    X_gmm=X_gmm, X_cox=X_cox, time=time, status=status,
+  # CV with THE FIX
+  cv <- tryCatch(cv_select_K_gamma_v4(
+    X_gmm=sd$X_gmm, X_cox=sd$X_cox,
+    time=sd$time, status=sd$status,
     K_grid=K_grid, gamma_grid=gamma_grid,
-    nfolds=nfolds, alpha=alpha, max_iter=max_iter, n_starts=n_starts,
+    nfolds=nfolds, alpha=alpha,
+    max_iter=max_iter, n_starts=n_starts,
     log_transform=FALSE,
-    normalize_gmm_by_dim=FALSE,   ## <-- THE FIX
-    verbose=verbose, use_1se_rule=TRUE,
-    baseline_mode=baseline_mode
-  ), error=function(e) e)
+    normalize_gmm_by_dim=FALSE,      ## THE FIX
+    verbose=FALSE, use_1se_rule=TRUE,
+    baseline_mode="shared"
+  ),error=function(e)e)
+  if(inherits(cv,"error")){r$error_msg<-cv$message;return(r)}
+  b<-cv$best; if(is.null(b)||nrow(b)==0){r$error_msg<-"no model";return(r)}
 
-  if (inherits(cv_res,"error")){result$error_msg<-cv_res$message;return(result)}
-  best <- cv_res$best
-  if (is.null(best)||nrow(best)==0){result$error_msg<-"CV no model";return(result)}
+  Kh<-as.integer(b$K[1]); gh<-as.numeric(b$gamma[1])
+  r$K_selected<-Kh; r$K_correct<-as.integer(Kh==sd$params$K)
+  r$gamma_selected<-gh; r$cindex_cv<-as.numeric(b$mean_score[1])
 
-  K_hat<-as.integer(best$K[1]); gamma_hat<-as.numeric(best$gamma[1])
-  result$K_selected<-K_hat; result$K_correct<-as.integer(K_hat==K_true)
-  result$gamma_selected<-gamma_hat
-  result$cindex_cv<-as.numeric(best$mean_score[1])
+  # Final fit
+  prep<-preprocess_train_v4(sd$X_gmm,sd$X_cox,log_transform=FALSE)
+  fit<-tryCatch(gemcox_full_multistart_shared_v4(
+    X_gmm=prep$X_gmm, X_cox=prep$X_cox,
+    time=sd$time, status=sd$status,
+    K=Kh, alpha=alpha, max_iter=max_iter*2,
+    surv_weight=gh,
+    normalize_gmm_by_dim=FALSE,      ## THE FIX
+    verbose=FALSE, n_starts=n_starts_final
+  ),error=function(e)e)
+  if(inherits(fit,"error")){r$error_msg<-fit$message;return(r)}
+  r$converged<-1L
 
-  ## Final fit
-  prep <- preprocess_train_v4(X_gmm,X_cox,log_transform=FALSE)
-  fitter <- if(baseline_mode=="shared") gemcox_full_multistart_shared_v4 else gemcox_full_multistart
-  fit <- tryCatch(fitter(X_gmm=prep$X_gmm,X_cox=prep$X_cox,
-    time=time,status=status,K=K_hat,alpha=alpha,max_iter=max_iter*2,
-    surv_weight=gamma_hat,
-    normalize_gmm_by_dim=FALSE,   ## <-- THE FIX
-    verbose=FALSE,n_starts=n_starts_final),
-    error=function(e) e)
-  if (inherits(fit,"error")){result$error_msg<-fit$message;return(result)}
-  result$converged <- 1L
+  if(Kh==sd$params$K && sd$params$K>1)
+    r$ARI<-adjustedRandIndex(sd$Z_true,fit$clusterid)
 
-  if (K_hat==K_true && K_true>1)
-    result$ARI <- adjustedRandIndex(Z_true,fit$clusterid)
-
-  eta_full <- tryCatch({
-    tau<-fit$tau
-    em<-sapply(1:K_hat,function(k) eta_from_scaled(prep$X_cox,
+  eta<-tryCatch({tau<-fit$tau
+    em<-sapply(1:Kh,function(k)eta_from_scaled(prep$X_cox,
       fit$coxfit[[k]]$beta_s,fit$coxfit[[k]]$scaler))
-    if(is.vector(em)) em<-matrix(em,ncol=K_hat)
+    if(is.vector(em))em<-matrix(em,ncol=Kh)
     rowSums(tau*em)},error=function(e)NULL)
-  if (!is.null(eta_full)) result$cindex_full<-c_index(time,status,eta_full)
+  if(!is.null(eta)) r$cindex_full<-c_index(sd$time,sd$status,eta)
 
-  if (K_hat==K_true && K_true>1) {
-    tb<-sim_data$params$beta_list; eb<-lapply(1:K_hat,function(k)fit$beta[,k])
+  if(Kh==sd$params$K && sd$params$K>1){
+    tb<-sd$params$beta_list; eb<-lapply(1:Kh,function(k)fit$beta[,k])
     pc<-min(length(tb[[1]]),nrow(fit$beta))
-    cost<-matrix(0,K_true,K_hat)
-    for(i in 1:K_true)for(j in 1:K_hat)
+    cost<-matrix(0,sd$params$K,Kh)
+    for(i in 1:sd$params$K)for(j in 1:Kh)
       cost[i,j]<-mean((tb[[i]][1:pc]-eb[[j]][1:pc])^2)
-    used<-logical(K_hat);rv<-numeric(K_true)
-    for(i in 1:K_true){av<-which(!used);bj<-av[which.min(cost[i,av])]
+    used<-logical(Kh);rv<-numeric(sd$params$K)
+    for(i in 1:sd$params$K){av<-which(!used);bj<-av[which.min(cost[i,av])]
       rv[i]<-sqrt(cost[i,bj]);used[bj]<-TRUE}
-    result$beta_rmse<-mean(rv)
+    r$beta_rmse<-mean(rv)
   }
-  result
+  r
 }
 
-## ---- Grid ----
-RUN_DIAGNOSTIC <- TRUE
-sim_grid <- expand.grid(K_true=c(1,2,3), separation=c("low","med","high"),
-  event_rate=c(0.44,0.25), n_subjects=117, feat_corr=0.2,
-  stringsAsFactors=FALSE)
-sim_grid$scenario_id <- seq_len(nrow(sim_grid))
+###############################################################
+## Grid + execution
+###############################################################
+sim_grid <- expand.grid(
+  K_true=c(1,2,3), separation=c("low","med","high"),
+  event_rate=c(0.44,0.25), stringsAsFactors=FALSE)
+sim_grid$sid <- seq_len(nrow(sim_grid))
 
-if (RUN_DIAGNOSTIC) {
-  SIM_K_GRID<-1:3; SIM_GAMMA_GRID<-c(0,0.5,1.0,2.0)
-  SIM_NFOLDS<-3; SIM_MAX_ITER<-40
-  SIM_N_STARTS<-5; SIM_N_STARTS_FINAL<-10
-  NSIM<-25L
-} else {
-  SIM_K_GRID<-1:3; SIM_GAMMA_GRID<-c(0,0.25,0.5,1.0,2.0)
-  SIM_NFOLDS<-5; SIM_MAX_ITER<-60
-  SIM_N_STARTS<-5; SIM_N_STARTS_FINAL<-15
-  NSIM<-100L
-}
-N_CORES <- min(50L, max(1L, detectCores(logical=FALSE)-1L))
-cat(sprintf("Scenarios:%d Reps:%d Total:%d Cores:%d\n",
-            nrow(sim_grid),NSIM,nrow(sim_grid)*NSIM,N_CORES))
+## Tuned for < 10 min on 24-core Windows
+NSIM          <- 20L
+K_GRID        <- 1:3
+GAMMA_GRID    <- c(0, 1.0, 2.0)   # 3 values (was 4)
+CV_FOLDS      <- 3
+CV_MAX_ITER   <- 30                # 30 iter (was 40)
+CV_N_STARTS   <- 3                 # 3 starts (was 5)
+FINAL_STARTS  <- 5                 # 5 starts (was 10)
+ALPHA         <- 0.5
 
-run_scenario <- function(sc, nsim=NSIM) {
-  cat(sprintf("[%d] K=%d sep=%s er=%.2f\n",
-              sc$scenario_id,sc$K_true,sc$separation,sc$event_rate))
-  results <- lapply(seq_len(nsim), function(ri) {
-    sd <- tryCatch(simulate_gemcox_v4(n=sc$n_subjects,K=sc$K_true,
-      p_gmm=10,p_cox=10,p_gmm_signal=5,p_beta_signal=4,
-      separation=sc$separation,feat_corr=sc$feat_corr,
-      event_rate=sc$event_rate,seed=sc$scenario_id*10000+ri),
-      error=function(e)NULL)
-    if(is.null(sd))return(NULL)
-    res <- tryCatch(run_replicate_v4(sd,K_grid=SIM_K_GRID,
-      gamma_grid=SIM_GAMMA_GRID,nfolds=SIM_NFOLDS,max_iter=SIM_MAX_ITER,
-      n_starts=SIM_N_STARTS,n_starts_final=SIM_N_STARTS_FINAL,
-      alpha=0.5,baseline_mode="shared",verbose=FALSE),
+N_CORES <- min(24L, max(1L, detectCores(logical=FALSE)-1L))
+
+cat(sprintf("Grid: %d scenarios x %d reps = %d fits\n",
+            nrow(sim_grid), NSIM, nrow(sim_grid)*NSIM))
+cat(sprintf("CV grid: %d K x %d gamma x %d folds x %d starts = %d EM fits/rep\n",
+            length(K_GRID), length(GAMMA_GRID), CV_FOLDS, CV_N_STARTS,
+            length(K_GRID)*length(GAMMA_GRID)*CV_FOLDS*CV_N_STARTS))
+cat(sprintf("Cores: %d\n", N_CORES))
+
+run_scenario <- function(sc) {
+  cat(sprintf("[%d] K=%d sep=%s er=%.2f\n",sc$sid,sc$K_true,sc$separation,sc$event_rate))
+  out <- lapply(seq_len(NSIM), function(ri) {
+    d <- tryCatch(simulate_v4(n=117, K=sc$K_true, separation=sc$separation,
+      event_rate=sc$event_rate, seed=sc$sid*10000+ri), error=function(e)NULL)
+    if(is.null(d)) return(NULL)
+    res <- tryCatch(run_rep(d, K_grid=K_GRID, gamma_grid=GAMMA_GRID,
+      nfolds=CV_FOLDS, max_iter=CV_MAX_ITER, n_starts=CV_N_STARTS,
+      n_starts_final=FINAL_STARTS, alpha=ALPHA),
       error=function(e)list(error_msg=e$message))
-    res<-lapply(res,function(v)if(is.null(v)||length(v)==0)NA else v[1])
-    as.data.frame(c(list(scenario_id=sc$scenario_id,rep=ri,
-      K_true=sc$K_true,separation=sc$separation,
-      event_rate_target=sc$event_rate,n=sc$n_subjects),
-      res),stringsAsFactors=FALSE)
+    res <- lapply(res,function(v)if(is.null(v)||length(v)==0)NA else v[1])
+    as.data.frame(c(list(sid=sc$sid,rep=ri,K_true=sc$K_true,
+      separation=sc$separation,event_rate=sc$event_rate),res),
+      stringsAsFactors=FALSE)
   })
-  bind_rows(Filter(Negate(is.null),results))
+  dplyr::bind_rows(Filter(Negate(is.null),out))
 }
 
-run_par <- function(nj,FUN,nc){
-  if(nc<=1L)return(lapply(seq_len(nj),FUN))
-  if(.Platform$OS.type=="windows"){
-    cl<-makeCluster(nc,type="PSOCK");on.exit(stopCluster(cl))
-    clusterExport(cl,ls(.GlobalEnv),.GlobalEnv)
-    clusterEvalQ(cl,{library(survival);library(glmnet);library(MASS)
-                      library(mclust);library(dplyr);library(parallel)})
-    parLapply(cl,seq_len(nj),FUN)
-  } else mclapply(seq_len(nj),FUN,mc.cores=nc)
+## Windows PSOCK parallel
+message("========== v4 SIMULATION START ==========")
+t0 <- proc.time()
+
+if (N_CORES > 1 && .Platform$OS.type == "windows") {
+  cl <- makeCluster(N_CORES, type="PSOCK")
+  on.exit(stopCluster(cl), add=TRUE)
+  clusterExport(cl, ls(.GlobalEnv), .GlobalEnv)
+  clusterEvalQ(cl, {
+    library(survival); library(glmnet); library(MASS)
+    library(mclust); library(dplyr); library(parallel)
+  })
+  all_res <- parLapply(cl, seq_len(nrow(sim_grid)),
+    function(i) tryCatch(run_scenario(sim_grid[i,]),
+      error=function(e) data.frame(sid=sim_grid$sid[i],
+        error_msg=e$message, stringsAsFactors=FALSE)))
+} else if (N_CORES > 1) {
+  all_res <- mclapply(seq_len(nrow(sim_grid)),
+    function(i) tryCatch(run_scenario(sim_grid[i,]),
+      error=function(e) data.frame(sid=sim_grid$sid[i],
+        error_msg=e$message, stringsAsFactors=FALSE)),
+    mc.cores=N_CORES)
+} else {
+  all_res <- lapply(seq_len(nrow(sim_grid)),
+    function(i) run_scenario(sim_grid[i,]))
 }
 
-message("========== STARTING v4 SIMULATION (normalize_gmm_by_dim=FALSE) ==========")
-t0<-proc.time()
-all_res <- run_par(nrow(sim_grid),function(i)tryCatch(run_scenario(sim_grid[i,]),
-  error=function(e)data.frame(scenario_id=sim_grid$scenario_id[i],
-    error_msg=e$message,stringsAsFactors=FALSE)),N_CORES)
-elapsed<-(proc.time()-t0)[3]
-results_df <- bind_rows(Filter(is.data.frame,all_res))
-saveRDS(results_df,"GeMCox_simulation_v4_raw.rds")
+elapsed <- (proc.time()-t0)[3]
+results_df <- dplyr::bind_rows(Filter(is.data.frame, all_res))
+saveRDS(results_df, "GeMCox_simulation_v4_raw.rds")
 
-em<-results_df$error_msg
-ok<-is.na(em)|(nzchar(trimws(em))==FALSE)|(trimws(em)=="NA")
-df_ok<-results_df[ok,]
-cat(sprintf("\nSuccess:%d/%d(%.0f%%) in %.0fs\n",nrow(df_ok),nrow(results_df),
-    100*nrow(df_ok)/max(nrow(results_df),1),elapsed))
+## Summarize
+em <- results_df$error_msg
+ok <- is.na(em) | !nzchar(trimws(em)) | trimws(em)=="NA"
+df_ok <- results_df[ok,]
+cat(sprintf("\nSuccess: %d/%d (%.0f%%)  Time: %.0f sec (%.1f min)\n",
+    nrow(df_ok), nrow(results_df),
+    100*nrow(df_ok)/max(nrow(results_df),1), elapsed, elapsed/60))
 
 summary_df <- df_ok %>%
-  group_by(K_true,separation,event_rate_target) %>%
-  summarise(n_reps=n(),
-    K_sel_accuracy=mean(K_correct,na.rm=TRUE),
-    K_sel_mean=mean(K_selected,na.rm=TRUE),
-    ARI_mean=mean(ARI,na.rm=TRUE), ARI_sd=sd(ARI,na.rm=TRUE),
-    cindex_full_mean=mean(cindex_full,na.rm=TRUE),
-    cindex_cv_mean=mean(cindex_cv,na.rm=TRUE),
-    cindex_cox1_mean=mean(cindex_cox1,na.rm=TRUE),
-    cindex_gain_mean=mean(cindex_full-cindex_cox1,na.rm=TRUE),
-    gamma_mean=mean(gamma_selected,na.rm=TRUE),
-    converge_rate=mean(converged,na.rm=TRUE),.groups="drop") %>%
-  mutate(across(where(is.numeric),~round(.x,4)))
+  group_by(K_true, separation, event_rate) %>%
+  summarise(
+    n_reps           = n(),
+    K_sel_accuracy   = round(mean(K_correct, na.rm=TRUE), 3),
+    K_sel_mean       = round(mean(K_selected, na.rm=TRUE), 2),
+    ARI_mean         = round(mean(ARI, na.rm=TRUE), 3),
+    ARI_sd           = round(sd(ARI, na.rm=TRUE), 3),
+    cindex_full_mean = round(mean(cindex_full, na.rm=TRUE), 3),
+    cindex_cv_mean   = round(mean(cindex_cv, na.rm=TRUE), 3),
+    cindex_cox1_mean = round(mean(cindex_cox1, na.rm=TRUE), 3),
+    cindex_gain      = round(mean(cindex_full - cindex_cox1, na.rm=TRUE), 3),
+    gamma_mean       = round(mean(gamma_selected, na.rm=TRUE), 2),
+    converge_rate    = round(mean(converged, na.rm=TRUE), 2),
+    .groups="drop")
 
-write.csv(summary_df,"GeMCox_simulation_v4_summary.csv",row.names=FALSE)
+write.csv(summary_df, "GeMCox_simulation_v4_summary.csv", row.names=FALSE)
+
 cat("\n========== v4 RESULTS ==========\n")
-print(as.data.frame(summary_df))
-message(sprintf("========== v4 COMPLETE (%.0fs) ==========",elapsed))
+print(as.data.frame(summary_df), right=FALSE)
+cat(sprintf("\nTotal wall time: %.1f min\n", elapsed/60))
+message("========== v4 COMPLETE ==========")
