@@ -279,6 +279,11 @@ run_replicate_v3 <- function(sim_data,
 
 RUN_DIAGNOSTIC <- TRUE
 
+## Fast profile tuned for ~<5 min on a 24-core workstation.
+## Keep this TRUE unless you intentionally run a longer/high-precision study.
+FAST_5MIN_PROFILE <- TRUE
+TARGET_CORES <- 24L
+
 sim_grid <- expand.grid(
   K_true = c(1, 2, 3, 4), separation = c("low", "med", "high"),
   event_rate = c(0.44, 0.25), n_subjects = 117,
@@ -286,7 +291,16 @@ sim_grid <- expand.grid(
 )
 sim_grid$scenario_id <- seq_len(nrow(sim_grid))
 
-if (RUN_DIAGNOSTIC) {
+if (FAST_5MIN_PROFILE) {
+  ## Very lean CV/fitting settings: 24 scenarios x ~8 reps/scenario in parallel.
+  SIM_K_GRID <- 1:3
+  SIM_GAMMA_GRID <- c(0, 0.5, 1.0)
+  SIM_NFOLDS <- 2
+  SIM_MAX_ITER <- 20
+  SIM_N_STARTS <- 2
+  SIM_N_STARTS_FINAL <- 3
+  NSIM <- 8L
+} else if (RUN_DIAGNOSTIC) {
   SIM_K_GRID <- 1:3;  SIM_GAMMA_GRID <- c(0, 0.5, 1.0, 2.0)
   SIM_NFOLDS <- 3;    SIM_MAX_ITER <- 30
   SIM_N_STARTS <- 3;  SIM_N_STARTS_FINAL <- 5
@@ -299,7 +313,17 @@ if (RUN_DIAGNOSTIC) {
 }
 
 SIM_ALPHA <- 0.5
-N_CORES <- min(50L, max(1L, detectCores(logical = FALSE) - 1L))
+N_CORES <- min(TARGET_CORES, max(1L, detectCores(logical = FALSE) - 1L))
+
+estimate_wallclock_min <- function() {
+  ## Rough budgeting heuristic: dominant work = CV fits + final multistart fit.
+  fits_per_rep <- length(SIM_K_GRID) * length(SIM_GAMMA_GRID) * SIM_NFOLDS * SIM_N_STARTS +
+    SIM_N_STARTS_FINAL
+  ## Nominal fit-time proxy calibrated conservatively for n~117, p~10.
+  sec_per_fit <- 0.35
+  sec_per_scenario <- NSIM * fits_per_rep * sec_per_fit
+  ceiling((nrow(sim_grid) / max(1, N_CORES)) * sec_per_scenario / 60)
+}
 
 run_scenario_v3 <- function(sc_row, nsim = NSIM) {
   K_true <- sc_row$K_true; sep <- sc_row$separation
@@ -354,6 +378,11 @@ run_parallel_v3 <- function(n_jobs, FUN, nc) {
 }
 
 message("========== STARTING v3 SIMULATION ==========")
+message(sprintf("Config: FAST_5MIN_PROFILE=%s | cores=%d | NSIM=%d | folds=%d | starts=%d/%d | gamma=%s",
+                FAST_5MIN_PROFILE, N_CORES, NSIM, SIM_NFOLDS,
+                SIM_N_STARTS, SIM_N_STARTS_FINAL,
+                paste(SIM_GAMMA_GRID, collapse=",")))
+message(sprintf("Estimated wall-clock (heuristic): ~%d min", estimate_wallclock_min()))
 all_res <- run_parallel_v3(nrow(sim_grid),
   function(i) tryCatch(run_scenario_v3(sim_grid[i,]),
     error = function(e) data.frame(scenario_id = sim_grid$scenario_id[i],
