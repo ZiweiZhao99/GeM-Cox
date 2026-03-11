@@ -1,0 +1,207 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\bX}{\mathbf{X}}
+\newcommand{\bW}{\mathbf{W}}
+\newcommand{\bmu}{\boldsymbol{\mu}}
+\newcommand{\bSigma}{\boldsymbol{\Sigma}}
+\newcommand{\bbeta}{\boldsymbol{\beta}}
+\newtheorem{remark}{Remark}
+
+\definecolor{revcolor}{rgb}{0.0,0.0,0.6}
+\newcommand{\rev}[1]{\textcolor{revcolor}{#1}}
+\newenvironment{revblock}{\color{revcolor}}{}
+
+\title{\textbf{GeM-Cox: Generative Mixture of Cox Regression Models}\\[4pt]
+\large Revised Formulation --- March 11, 2026\\[4pt]
+\normalsize\textit{Revisions in} \rev{blue}}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Data and Notation}
+
+Let $\bX_i\!\in\!\mathbb{R}^p$ denote the feature vector for subject $i=1,\ldots,n$, and let $T_i$ be the latent event time. Each subject is observed as $(\bx_i, t_i, \delta_i)$, where $t_i = \min(T_i, U_i)$ and $\delta_i = \mathbf{1}(T_i \le U_i)$.
+
+We define two feature sets: $\bX_i^{\mathrm{gmm}}\!\in\!\mathbb{R}^q$ (clustering) and $\bX_i^{\mathrm{cox}}\!\in\!\mathbb{R}^p$ (survival prediction).
+
+\begin{revblock}
+In addition, let $\bX_i^{\mathrm{cov}}\!\in\!\mathbb{R}^r$ denote non-clustering covariates (e.g.\ age, sex) that enter the Cox model but not the GMM. Then $\bX_i^{\mathrm{cox}}$ may include immune features plus these covariates.
+\end{revblock}
+
+Let $C$ denote the number of latent clusters and $Z_i\in\{1,\ldots,C\}$ the latent cluster label.
+
+
+\begin{revblock}
+\section{Preprocessing Pipeline}\label{sec:preprocess}
+
+\subsection{Feature Transformation}
+Many immunological measurements exhibit strong right-skewness (skewness ${>}2$). Apply $x \mapsto \log(1+x)$ to features with skewness exceeding~1. This reduces skewness, stabilizes variance across measurement scales, and improves the within-cluster Gaussian assumption. For features that are already symmetric, omit the transform.
+
+\subsection{Missing Data Handling}
+Apply multiple imputation (e.g.\ predictive mean matching via \texttt{mice}) \emph{within each CV training fold}. For the GMM feature set, prefer selecting features with low missingness (${<}5\%$) to avoid propagating imputation noise into cluster assignments.
+
+\subsection{Standardization}
+After transformation and imputation, standardize all features to zero mean and unit variance using training-set statistics.
+
+\subsection{GMM Feature Selection}\label{sec:gmm-feat-sel}
+Three recommended strategies: (1)~\textbf{Domain-guided}: select features from biologically relevant groups with low missingness. (2)~\textbf{PCA-based}: project onto the top $q$ PCs capturing 60--80\% of variance. (3)~\textbf{Low-missing complete features}: use only features with ${\approx}0\%$ missingness for the GMM.
+
+\textbf{Caution}: Selecting GMM features by raw variance is unreliable when features are on different measurement scales. After standardization all variances equal~1, making the criterion uninformative.
+\end{revblock}
+
+
+\section{Model Specification}
+
+\subsection{Cluster prior}
+$P(Z_i = c) = \pi_c$, with $\sum_{c=1}^C \pi_c = 1$, $\pi_c > 0$.
+
+\subsection{Feature model (GMM)}
+Given $Z_i=c$: \; $p(\bx_i^{\mathrm{gmm}} \mid Z_i\!=\!c) = \mathcal{N}(\bx_i^{\mathrm{gmm}} \mid \bmu_c, \bSigma_c)$.
+
+\subsection{Survival model within cluster $c$}
+
+\rev{Two formulations are provided; the shared-baseline formulation is recommended as the default for small~$n$.}
+
+\paragraph{Separate-baseline formulation.}
+$\lambda_c(t\mid\bx) = \lambda_{0c}(t)\exp(\bbeta_c^\top\bx)$, with cluster-specific baseline hazard $\lambda_{0c}(t)$.
+
+\begin{revblock}
+\paragraph{Shared-baseline formulation (default for small $n$).}\label{sec:shared-baseline}
+\begin{equation}\label{eq:shared-baseline}
+  \lambda_c(t\mid\bx) = \lambda_0(t)\exp(\bbeta_c^\top\bx),
+\end{equation}
+where $\lambda_0(t)$ is a common baseline hazard shared across all clusters while $\bbeta_c$ remains cluster-specific. This reduces the number of nonparametric components from $C$ to~1, substantially improving stability when $n/C < 50$.
+\end{revblock}
+
+\subsection{Joint observed-data density}
+\begin{equation}
+  p(\bx_i, t_i, \delta_i) = \sum_{c=1}^C \pi_c\,\mathcal{N}(\bx_i^{\mathrm{gmm}}\mid\bmu_c,\bSigma_c)\,f_c(t_i,\delta_i\mid\bx_i^{\mathrm{cox}}).
+\end{equation}
+
+
+\section{Complete-Data Log-Likelihood}
+
+$\log p(\bX,t,\delta,Z\mid\theta) = \ell_\pi + \ell_{\mathrm{GMM}} + \ell_{\mathrm{surv}}$, decomposing additively as before.
+
+
+\section{EM Algorithm}
+
+\subsection{E-step with dimensionality-adjusted scaling}
+\begin{equation}\label{eq:estep}
+  \log r_{ic}^{(k)} = \log\pi_c^{(k)} + \frac{1}{q_{\mathrm{eff}}}\log\mathcal{N}\!\bigl(\bx_i^{\mathrm{gmm}}\mid\bmu_c^{(k)},\bSigma_c^{(k)}\bigr) + \gamma\log f_c\!\bigl(t_i,\delta_i\mid\bx_i^{\mathrm{cox}};\theta_c^{(k)}\bigr),
+\end{equation}
+with $\tau_{ic}^{(k)} = r_{ic}^{(k)} / \sum_{c'} r_{ic'}^{(k)}$.
+
+\begin{revblock}
+\paragraph{Effective dimensionality $q_{\mathrm{eff}}$.}
+\textbf{Default}: $q_{\mathrm{eff}} = q$, appropriate when GMM features are pre-selected to be informative (Section~\ref{sec:gmm-feat-sel}). \textbf{Alternative}: eigenvalue-based $q_{\mathrm{eigen}} = (\sum_j \lambda_j)^2/\sum_j \lambda_j^2$, useful when all features are retained. In practice, careful GMM feature selection followed by $q_{\mathrm{eff}}=q$ is preferred.
+\end{revblock}
+
+\subsection{M-step}
+
+\paragraph{GMM updates.}
+Standard weighted moments for $\pi_c, \bmu_c, \bSigma_c$. Diagonal covariance is the default for stability.
+
+\begin{revblock}
+\paragraph{Cox coefficient updates: elastic net regularization.}
+\begin{equation}
+  \bbeta_c^{(k+1)} = \arg\max_{\bbeta_c}\left\{\ell_c^{(k)}(\bbeta_c) - \lambda\!\left[\tfrac{1-\alpha}{2}\|\bbeta_c\|_2^2 + \alpha\|\bbeta_c\|_1\right]\right\}.
+\end{equation}
+We recommend $\alpha = 0.5$ when features exhibit block correlation with redundancy, common in immunological data. The penalty $\lambda$ is selected once per CV fold via \texttt{cv.glmnet} on training data ($C\!=\!1$) before the EM begins.
+\end{revblock}
+
+\begin{revblock}
+\paragraph{Shared Breslow estimator (default).}
+With formulation~(\ref{eq:shared-baseline}), the Breslow estimator at event time $t_{(m)}$ is:
+\begin{equation}
+  d\hat{\Lambda}_0(t_{(m)}) = \frac{\sum_{i:\,t_i=t_{(m)},\,\delta_i=1} 1}{\sum_{c=1}^C \sum_{j\in\mathcal{R}(t_{(m)})} \tau_{jc}\exp(\bbeta_c^\top\bx_j)}\,.
+\end{equation}
+With $\hat{\Lambda}_0$ fixed, each $\bbeta_c$ is updated by maximizing a weighted Poisson regression:
+\begin{equation}
+  \ell_c^{\mathrm{shared}}(\bbeta_c) = \sum_{i=1}^n \tau_{ic}\bigl[\delta_i\,\bbeta_c^\top\bx_i - \hat{\Lambda}_0(t_i)\exp(\bbeta_c^\top\bx_i)\bigr],
+\end{equation}
+implementable via \texttt{glmnet} with \texttt{family="poisson"} and offset $\log\hat{\Lambda}_0(t_i)$.
+\end{revblock}
+
+\paragraph{Separate Breslow (optional, for large $n$).}
+When $n/C \gg 50$, cluster-specific $\Lambda_{0c}$ may be estimated as before.
+
+
+\section{Initialization}
+
+\paragraph{Supervised initialization (recommended).}
+(1)~Fit a single Cox model to obtain risk scores $\hat{\eta}_i$. (2)~Standardize to unit variance. (3)~Form $\bW_i = (\tilde{\bX}_i^{\mathrm{gmm}},\;\xi\hat{\eta}_i)^\top$ with $\xi\!=\!1$. (4)~Run $k$-means on $\bW$ with ${\ge}50$ restarts.
+
+\begin{revblock}
+\paragraph{Number of EM restarts.}
+We recommend ${\ge}5$ random restarts during cross-validation and ${\ge}10$ for the final fit. For $C\ge 4$, increase to 10 and 20 respectively.
+\end{revblock}
+
+
+\section{Model Selection}\label{sec:model-sel}
+
+\begin{revblock}
+\paragraph{Search grid.}
+$C \in \{1, 2, 3\}$ (for $n<150$, $C\!=\!4$ is rarely identifiable). $\gamma \in \{0, 0.25, 0.5, 1.0, 2.0\}$. Include $\gamma\!=\!0$ as an unsupervised baseline.
+\end{revblock}
+
+\paragraph{CV criterion.}
+Select $(C,\gamma)$ by 5-fold stratified CV of Harrell's C-index using the soft-weighted linear predictor $\hat{\eta}_i = \sum_c \tau_{ic}^{\mathrm{test}}\hat{\bbeta}_c^\top\bx_i^{\mathrm{cox}}$, where $\tau_{ic}^{\mathrm{test}}$ uses the GMM only.
+
+\begin{revblock}
+\paragraph{One-standard-error rule for parsimony.}\label{sec:1se}
+(1)~Compute the mean and SE of the CV C-index for each $(C,\gamma)$. (2)~Let $\bar{S}^*$ and $\mathrm{SE}^*$ be the best configuration's statistics. (3)~Among configurations with mean ${\ge}\bar{S}^* - \mathrm{SE}^*$, select smallest~$C$ (ties broken by smallest~$\gamma$).
+\end{revblock}
+
+
+\section{Prediction}
+
+Given a new subject: (1)~Compute $\tau_c^{\mathrm{new}}$ from the fitted GMM. (2)~Risk score: $\hat{\eta} = \sum_c \tau_c^{\mathrm{new}}\hat{\bbeta}_c^\top\bx^{\mathrm{cox}}$. (3)~Survival: $\hat{S}(t) = \sum_c \tau_c^{\mathrm{new}}\exp[-\hat{\Lambda}_0(t)\exp(\hat{\bbeta}_c^\top\bx^{\mathrm{cox}})]$.
+
+
+\begin{revblock}
+\section{Practical Guidelines}
+
+\paragraph{When is GeM-Cox appropriate?}
+Small-to-moderate sample size ($50 \le n \le 500$); suspected heterogeneity in the feature--outcome relationship; desire for interpretable cluster-specific biomarkers.
+
+\paragraph{Interpreting heterogeneity.}
+Selecting $C>1$ is necessary but not sufficient evidence of heterogeneity. Also examine similarity of the $\bbeta_c$ vectors. If they are nearly identical, the model may have favored $C>1$ for marginal predictive gain without meaningful heterogeneity.
+
+\paragraph{Minimum sample size guidelines.}
+With shared baseline: ${\ge}15$ effective events/cluster for $C\!=\!2$, ${\ge}10$ for $C\!=\!3$. With separate baselines: ${\ge}25$ and ${\ge}20$ respectively.
+\end{revblock}
+
+
+\section{Summary of Changes}
+
+\begin{center}\small
+\begin{tabular}{p{3cm}p{5cm}p{5.5cm}}
+\toprule
+\textbf{Aspect} & \textbf{March 9} & \textbf{Revised (March 11)} \\
+\midrule
+Preprocessing & Not specified & Log-transform, imputation, standardization (Sec.~\ref{sec:preprocess}) \\[3pt]
+GMM features & Assumed given & Three strategies; caution on variance-based (Sec.~\ref{sec:gmm-feat-sel}) \\[3pt]
+Baseline default & Separate $\Lambda_{0c}$ & Shared $\Lambda_0$ for $n/C<50$ \\[3pt]
+Elastic net $\alpha$ & Implicitly 0 & Recommend $\alpha=0.5$ \\[3pt]
+$\gamma$ grid & Unspecified & $\{0, 0.25, 0.5, 1.0, 2.0\}$ \\[3pt]
+$K$ selection & Best CV score & 1-SE rule (Sec.~\ref{sec:1se}) \\[3pt]
+EM restarts & Unspecified & $\ge 5$ (CV), $\ge 10$ (final) \\[3pt]
+Covariates & Not addressed & Cox-only feature split \\[3pt]
+Missing data & Not addressed & MI within CV folds \\[3pt]
+Interpretation & Brief note & $C>1 \not\Rightarrow$ heterogeneity \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
