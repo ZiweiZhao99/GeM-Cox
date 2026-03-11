@@ -17,10 +17,18 @@
 ##      because the features are already on the transformed scale
 ###############################################################
 
-required_pkgs <- c("survival", "glmnet", "mclust", "MASS", "dplyr", "tidyr")
+required_pkgs <- c("survival", "glmnet", "mclust", "MASS", "dplyr", "tidyr",
+                   "ggplot2", "patchwork", "tibble", "scales", "parallel")
+user_r_lib <- Sys.getenv("R_LIBS_USER")
+if (!nzchar(user_r_lib)) {
+  user_r_lib <- file.path(Sys.getenv("LOCALAPPDATA"), "R", "win-library",
+                          paste(R.version$major, sub("\\..*$", "", R.version$minor), sep = "."))
+}
+if (!dir.exists(user_r_lib)) dir.create(user_r_lib, recursive = TRUE, showWarnings = FALSE)
+.libPaths(c(user_r_lib, .libPaths()))
 for (pkg in required_pkgs) {
   if (!requireNamespace(pkg, quietly = TRUE)) {
-    install.packages(pkg, repos = "https://cloud.r-project.org")
+    install.packages(pkg, repos = "https://cloud.r-project.org", lib = user_r_lib)
   }
 }
 
@@ -30,8 +38,16 @@ library(mclust)
 library(MASS)
 library(dplyr)
 library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(tibble)
+library(scales)
+library(parallel)
 
-source("GeMCox_improved_v4_patch.R")
+engine_candidates <- c("GeMCox_improved_v4_patch.R", "GeMCox_improved_v4.R")
+engine_path <- engine_candidates[file.exists(engine_candidates)][1]
+if (!nzchar(engine_path)) stop("Could not find GeMCox_improved_v4_patch.R or GeMCox_improved_v4.R")
+source(engine_path)
 
 ###############################################################
 ## 1. Build an empirical CVIA078 template
@@ -336,55 +352,189 @@ run_replicate_cvia078_v4 <- function(sim_data,
   out
 }
 
+resolve_study_profile_v4 <- function(profile = c("fast_10min", "diagnostic", "full"),
+                                     nsim = NULL) {
+  profile <- match.arg(profile)
+  cfg <- switch(
+    profile,
+    fast_10min = list(
+      profile = profile,
+      nsim = 12L,
+      K_grid = 1:3,
+      gamma_grid = c(0, 0.5, 1.0),
+      nfolds = 2L,
+      alpha = 0.5,
+      max_iter = 25L,
+      n_starts = 2L,
+      n_starts_final = 3L
+    ),
+    diagnostic = list(
+      profile = profile,
+      nsim = 24L,
+      K_grid = 1:3,
+      gamma_grid = c(0, 0.25, 0.5, 1.0),
+      nfolds = 3L,
+      alpha = 0.5,
+      max_iter = 35L,
+      n_starts = 3L,
+      n_starts_final = 4L
+    ),
+    full = list(
+      profile = profile,
+      nsim = 50L,
+      K_grid = 1:3,
+      gamma_grid = c(0, 0.25, 0.5, 1.0),
+      nfolds = 5L,
+      alpha = 0.5,
+      max_iter = 60L,
+      n_starts = 5L,
+      n_starts_final = 10L
+    )
+  )
+  if (!is.null(nsim)) cfg$nsim <- as.integer(nsim)
+  cfg
+}
+
+run_parallel_jobs_v4 <- function(job_grid, worker_fun, n_cores) {
+  n_jobs <- nrow(job_grid)
+  if (n_jobs == 0) return(list())
+  if (n_cores <= 1L) return(lapply(seq_len(n_jobs), worker_fun))
+  if (.Platform$OS.type == "windows") {
+    cl <- makeCluster(n_cores, type = "PSOCK")
+    on.exit(stopCluster(cl))
+    clusterExport(cl, ls(.GlobalEnv), .GlobalEnv)
+    clusterEvalQ(cl, {
+      library(survival)
+      library(glmnet)
+      library(mclust)
+      library(MASS)
+      library(dplyr)
+      library(tidyr)
+      library(ggplot2)
+      library(patchwork)
+      library(tibble)
+      library(scales)
+      library(parallel)
+    })
+    parLapplyLB(cl, seq_len(n_jobs), worker_fun)
+  } else {
+    mclapply(seq_len(n_jobs), worker_fun, mc.cores = n_cores)
+  }
+}
+
+estimate_wallclock_v4 <- function(n_jobs, cfg, n_cores) {
+  fits_per_rep <- length(cfg$K_grid) * length(cfg$gamma_grid) * cfg$nfolds * cfg$n_starts +
+    cfg$n_starts_final
+  sec_per_fit <- switch(cfg$profile,
+                        fast_10min = 0.45,
+                        diagnostic = 0.60,
+                        full = 0.80,
+                        0.60)
+  ceiling(n_jobs * fits_per_rep * sec_per_fit / max(1, n_cores) / 60)
+}
+
 run_simulation_study_cvia078_v4 <- function(template,
                                             scenario_grid = NULL,
-                                            nsim = 50,
+                                            nsim = NULL,
                                             seed = 1,
-                                            baseline_mode = "shared") {
+                                            baseline_mode = "shared",
+                                            profile = c("fast_10min", "diagnostic", "full"),
+                                            n_cores = min(24L, max(1L, parallel::detectCores(logical = FALSE))),
+                                            save_outputs = TRUE,
+                                            output_prefix = "GeMCox_simulation_v4_template") {
+  cfg <- resolve_study_profile_v4(profile = profile, nsim = nsim)
   if (is.null(scenario_grid)) {
     scenario_grid <- expand.grid(
       K_true = c(1, 2, 3),
       separation = c("low", "med", "high"),
       event_rate_target = c(template$event_rate, 0.30),
+      n = template$n,
+      feat_corr = 0.2,
       stringsAsFactors = FALSE
     )
   }
+  if (!"n" %in% names(scenario_grid)) scenario_grid$n <- template$n
+  if (!"feat_corr" %in% names(scenario_grid)) scenario_grid$feat_corr <- 0.2
   scenario_grid$scenario_id <- seq_len(nrow(scenario_grid))
-  
-  all_res <- vector("list", nrow(scenario_grid))
-  for (i in seq_len(nrow(scenario_grid))) {
-    sc <- scenario_grid[i, ]
-    message(sprintf("Scenario %d: K=%d sep=%s er=%.2f",
-                    sc$scenario_id, sc$K_true, sc$separation, sc$event_rate_target))
-    
-    res_i <- lapply(seq_len(nsim), function(r) {
-      dat <- simulate_cvia078_like_v4(
+
+  job_grid <- tidyr::crossing(scenario_grid, rep = seq_len(cfg$nsim))
+  n_cores <- as.integer(max(1L, min(n_cores, nrow(job_grid))))
+
+  message(sprintf("Running CVIA078-like study: profile=%s | scenarios=%d | reps=%d | jobs=%d | cores=%d",
+                  cfg$profile, nrow(scenario_grid), cfg$nsim, nrow(job_grid), n_cores))
+  message(sprintf("Settings: folds=%d | starts=%d/%d | gamma=%s | max_iter=%d",
+                  cfg$nfolds, cfg$n_starts, cfg$n_starts_final,
+                  paste(cfg$gamma_grid, collapse = ","), cfg$max_iter))
+  message(sprintf("Estimated wall-clock (heuristic): ~%d min",
+                  estimate_wallclock_v4(nrow(job_grid), cfg, n_cores)))
+
+  all_res <- run_parallel_jobs_v4(job_grid, function(i) {
+    sc <- job_grid[i, ]
+    dat <- tryCatch(
+      simulate_cvia078_like_v4(
         template = template,
-        n = template$n,
+        n = sc$n,
         K_true = sc$K_true,
         separation = sc$separation,
         event_rate_target = sc$event_rate_target,
         baseline_mode = baseline_mode,
-        seed = seed + 1000 * i + r
-      )
-      ans <- run_replicate_cvia078_v4(dat, baseline_mode = baseline_mode, verbose = FALSE)
-      data.frame(
+        seed = seed + 1000 * sc$scenario_id + sc$rep
+      ),
+      error = function(e) e
+    )
+
+    if (inherits(dat, "error")) {
+      return(data.frame(
         scenario_id = sc$scenario_id,
-        rep = r,
+        rep = sc$rep,
         K_true = sc$K_true,
         separation = sc$separation,
         event_rate_target = sc$event_rate_target,
-        ans,
+        n = sc$n,
+        feat_corr = sc$feat_corr,
+        baseline_mode = baseline_mode,
+        error_msg = dat$message,
         stringsAsFactors = FALSE
-      )
-    })
-    
-    all_res[[i]] <- dplyr::bind_rows(res_i)
-  }
-  
+      ))
+    }
+
+    ans <- tryCatch(
+      run_replicate_cvia078_v4(
+        dat,
+        K_grid = cfg$K_grid,
+        gamma_grid = cfg$gamma_grid,
+        nfolds = cfg$nfolds,
+        alpha = cfg$alpha,
+        max_iter = cfg$max_iter,
+        n_starts = cfg$n_starts,
+        n_starts_final = cfg$n_starts_final,
+        baseline_mode = baseline_mode,
+        verbose = FALSE
+      ),
+      error = function(e) list(error_msg = e$message)
+    )
+    ans <- lapply(ans, function(v) if (is.null(v) || length(v) == 0) NA else v[1])
+    data.frame(
+      scenario_id = sc$scenario_id,
+      rep = sc$rep,
+      K_true = sc$K_true,
+      separation = sc$separation,
+      event_rate_target = sc$event_rate_target,
+      n = sc$n,
+      feat_corr = sc$feat_corr,
+      baseline_mode = baseline_mode,
+      ans,
+      stringsAsFactors = FALSE
+    )
+  }, n_cores = n_cores)
+
   raw_df <- dplyr::bind_rows(all_res)
-  summary_df <- raw_df |>
-    dplyr::group_by(K_true, separation, event_rate_target) |>
+  em <- raw_df$error_msg
+  ok <- is.na(em) | (nzchar(trimws(em)) == FALSE) | (trimws(em) == "NA")
+  df_ok <- raw_df[ok, , drop = FALSE]
+
+  summary_df <- df_ok |>
+    dplyr::group_by(K_true, separation, event_rate_target, n, feat_corr, baseline_mode) |>
     dplyr::summarise(
       n_reps = dplyr::n(),
       K_sel_accuracy = mean(K_correct, na.rm = TRUE),
@@ -395,9 +545,115 @@ run_simulation_study_cvia078_v4 <- function(template,
       gamma_mean = mean(gamma_selected, na.rm = TRUE),
       .groups = "drop"
     )
-  
-  list(raw = raw_df, summary = summary_df, scenario_grid = scenario_grid)
+
+  figs <- make_figures_cvia078_v4(summary_df, raw_df,
+                                  fig_dir = file.path("figures", output_prefix),
+                                  prefix = output_prefix)
+
+  if (isTRUE(save_outputs)) {
+    saveRDS(raw_df, paste0(output_prefix, "_raw.rds"))
+    write.csv(summary_df, paste0(output_prefix, "_summary.csv"), row.names = FALSE)
+  }
+
+  list(
+    raw = raw_df,
+    summary = summary_df,
+    figures = figs,
+    ok_rows = df_ok,
+    scenario_grid = scenario_grid,
+    run_config = cfg
+  )
+}
+
+###############################################################
+## Section 6: Figures
+###############################################################
+
+theme_gemcox <- function() {
+  theme_bw(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      strip.background = element_rect(fill = "#1a3a5c", color = NA),
+      strip.text = element_text(color = "white", face = "bold"),
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(color = "grey40", size = 10)
+    )
+}
+
+sep_levels <- c("low", "med", "high")
+sep_colors <- c(low = "#e08060", med = "#5b9bd5", high = "#3a7a3a")
+
+prep_summary <- function(df, rho = 0.2, n_val = NULL) {
+  out <- df %>%
+    filter(feat_corr == rho)
+  if (!is.null(n_val)) out <- out %>% filter(n == n_val)
+  out %>%
+    mutate(
+      separation = factor(separation, levels = sep_levels),
+      event_rate_label = paste0("Event rate: ", event_rate_target),
+      K_label = paste0("K = ", K_true),
+      n_label = paste0("n = ", n)
+    ) %>%
+    droplevels()
+}
+
+prep_results <- function(df, rho = 0.2, n_val = 117) {
+  df %>%
+    filter(feat_corr == rho, n == n_val) %>%
+    mutate(
+      separation = factor(separation, levels = sep_levels),
+      event_rate_label = paste0("Event rate: ", event_rate_target),
+      K_label = paste0("K = ", K_true)
+    ) %>%
+    droplevels()
+}
+
+make_figures_cvia078_v4 <- function(summary_df,
+                                    results_df,
+                                    rho = 0.2,
+                                    n_val = NULL,
+                                    fig_dir = "figures",
+                                    prefix = "GeMCox_simulation_v4_template") {
+  dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+  figs <- list()
+  summary_plot_df <- prep_summary(summary_df, rho = rho, n_val = n_val)
+  n_plot <- if (is.null(n_val)) sort(unique(results_df$n))[1] else n_val
+  figs$results_df_plot <- prep_results(results_df, rho = rho, n_val = n_plot)
+
+  if (nrow(summary_plot_df) == 0) {
+    warning("No rows matched the plotting filters; figures were not created.")
+    return(figs)
+  }
+
+  fig_ksel <- summary_plot_df %>%
+    ggplot(aes(x = separation, y = K_sel_accuracy,
+               color = separation, group = separation)) +
+    geom_point(size = 3) +
+    geom_hline(yintercept = 1 / 4, linetype = "dashed", color = "grey60",
+               linewidth = 0.5) +
+    facet_grid(n_label ~ K_label + event_rate_label) +
+    scale_color_manual(values = sep_colors, name = "Separation") +
+    scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+    labs(
+      title = "K-Selection Accuracy",
+      subtitle = "Proportion of replicates where CV correctly identified K_true  |  dashed = chance",
+      x = "Cluster Separation",
+      y = "P(K-hat = K_true)"
+    ) +
+    theme_gemcox()
+
+  figs$fig_ksel <- fig_ksel
+
+  ggsave(file.path(fig_dir, paste0(prefix, "_fig1_k_selection_accuracy.png")),
+         plot = fig_ksel, width = 12, height = 6.5, dpi = 300)
+  ggsave(file.path(fig_dir, paste0(prefix, "_fig1_k_selection_accuracy.pdf")),
+         plot = fig_ksel, width = 12, height = 6.5)
+
+  figs
 }
 
 cat("GeMCox_simulation_v4_template.R loaded.\n")
 cat("  Main idea: use build_cvia078_template_v4() then simulate_cvia078_like_v4().\n")
+cat("  Use run_simulation_study_cvia078_v4(profile = 'fast_10min') for the 24-core study run.\n")
